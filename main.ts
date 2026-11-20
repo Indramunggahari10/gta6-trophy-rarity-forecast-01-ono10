@@ -22,6 +22,14 @@
 //      0.0667 of the old cohort's). One refresh therefore dilutes a rate by about
 //      (1 + (6.0627 - 1) * 0.0667) / 6.0627 = 0.2206, the 100% trophy excepted:
 //      every new player holds it, so it stays at 100%.
+//      Two things change as the week goes on, and a constant 0.2206 per refresh
+//      would drive every median to ~0.01 over a 6,510-minute horizon:
+//      (a) the player base SATURATES: a refresh sweeps roughly half the players
+//      still untracked, so the absolute number of new players halves each time
+//      (3,230, then 1,615, 808, ...) and the multiplier falls toward 1;
+//      (b) later cohorts have played longer, so their per-trophy rate rho RISES
+//      from 0.0667 toward the old cohort's, with a 48-hour time constant measured
+//      from the first refresh (the launch-night cohort is the fresh baseline).
 //   3. THE REFRESH COUNT in the horizon is uncertain, so the forecast is a MIXTURE:
 //      refreshes arrive as a Poisson process (rate 0.212766 an hour, i.e. one every
 //      ~4.7 h, the cadence the rules' one observed refresh implies), each refresh
@@ -59,10 +67,16 @@ const Z = [-1.645, -0.674, 0, 0.674, 1.645];
 const RELEASE_MS = Date.parse('2026-11-19T00:00:00Z');
 /** Refresh hazard, per hour: one refresh every ~4.7 h (the rules' observed cadence). */
 const REFRESH_LAMBDA_PER_HOUR = 0.212766;
-/** Player-base multiplier of one refresh (638 -> 3,868 in the rules' refresh). */
-const REFRESH_PLAYER_MULT = 6.0627;
-/** A new cohort's per-trophy rate, as a fraction of the old cohort's (rules' aggregates). */
+/** A new cohort's per-trophy rate at the first refresh, as a fraction of the old cohort's (rules' aggregates). */
 const NEW_COHORT_FRAC = 0.0667;
+/** New players the rules' refresh added (3,868 - 638); each later refresh adds half as many again. */
+const REFRESH_NEW_PLAYERS_FIRST = 3230;
+/** Each later refresh adds this fraction as many new players as the previous one. */
+const REFRESH_NEW_PLAYERS_DECAY = 0.5;
+/** Time constant (hours) for a later cohort's rate to rise from NEW_COHORT_FRAC toward the old cohort's. */
+const RHO_TAU_HOURS = 48;
+/** The rules' first refresh (the 04:30Z read on 2026-11-19), the rho clock's anchor when the case history shows no refresh. */
+const FIRST_REFRESH_AT_MS = Date.parse('2026-11-19T04:30:00Z');
 /** Random-walk spread, logit units per square-root day (the house baseline's 0.5). */
 const RANDOM_WALK_SIGMA = 0.5;
 
@@ -199,19 +213,25 @@ function growthSlope(c: Case, i: number): number {
   return Math.min(2, Math.max(-1, w * fit.slope + (1 - w) * prior));
 }
 
-/** Refresh rate and player multiplier: fitted from detected refreshes, else priors. */
-function refreshParams(c: Case): { lambdaPerHour: number; playerMult: number } {
+/** Refresh rate: fitted from detected refreshes in the case history, else the prior. */
+function refreshRate(c: Case): number {
   const idx = refreshIndices(c);
-  if (idx.length === 0) return { lambdaPerHour: REFRESH_LAMBDA_PER_HOUR, playerMult: REFRESH_PLAYER_MULT };
+  if (idx.length === 0) return REFRESH_LAMBDA_PER_HOUR;
   const spanHours = Math.max(1, (Date.parse(c.at) - Date.parse(c.history[0].at)) / 3_600_000);
-  let mults: number[] = [];
-  for (const h of idx) mults.push(c.history[h].players_tracked / c.history[h - 1].players_tracked);
-  mults.sort((a, b) => a - b);
-  const medianMult = mults[Math.floor(mults.length / 2)];
-  return {
-    lambdaPerHour: Math.min(1, Math.max(0.02, idx.length / spanHours)),
-    playerMult: Math.min(20, Math.max(1.2, medianMult)),
-  };
+  return Math.min(1, Math.max(0.02, idx.length / spanHours));
+}
+
+/** Clock anchor for the new-cohort fraction: the first refresh the case history shows, else the rules' first refresh. */
+function firstRefreshMs(c: Case): number {
+  const idx = refreshIndices(c);
+  if (idx.length === 0) return FIRST_REFRESH_AT_MS;
+  return Date.parse(c.history[idx[0]].at);
+}
+
+/** A cohort joining at tMs holds this fraction of the old cohort's per-trophy rate. */
+function rhoAt(tMs: number, tFirstMs: number): number {
+  const dtHours = Math.max(0, (tMs - tFirstMs) / 3_600_000);
+  return 1 - (1 - NEW_COHORT_FRAC) * Math.exp(-dtHours / RHO_TAU_HOURS);
 }
 
 /**
@@ -223,16 +243,21 @@ function dilute(p: number, playerMult: number, rho: number): number {
   return (p + (playerMult - 1) * rho * p) / playerMult;
 }
 
-/** Simulate one refresh-count scenario: k refreshes, evenly spaced, growth between. */
+/** Simulate one refresh-count scenario: k refreshes, evenly spaced in log-time, growth between.
+ * Each refresh dilutes with that refresh's own player multiplier (saturating: the
+ * absolute number of new players halves each time, continuing the sequence the case
+ * history already shows) and that refresh's own new-cohort fraction rho (rising
+ * from the launch-night 0.0667 toward the old cohort's as cohorts join later). */
 function simulateScenario(c: Case, i: number, k: number, slope: number): number {
-  const horizonHours = c.horizon_minutes / 60;
   const t0 = c.at;
   const u0 = Math.log1p(Math.max(0, hoursSinceRelease(t0)));
   const u1 = Math.log1p(Math.max(0, hoursSinceRelease(c.target)));
-  const { playerMult } = refreshParams(c);
   const lastPct = lastRate(c, i);
   const ubiquitous = lastPct >= 99.99;
-  const rho = ubiquitous ? 1 : NEW_COHORT_FRAC;
+  const nSeen = refreshIndices(c).length;
+  const tFirst = firstRefreshMs(c);
+  // Player base at the case time (the last read), growing refresh by refresh.
+  let players = c.history[c.history.length - 1].players_tracked;
   let l = logit(lastPct);
   if (k === 0) return invLogitPct(l + slope * (u1 - u0));
   // Refresh j lands at u0 + (j + 0.5) / k * (u1 - u0) in log-time.
@@ -241,8 +266,14 @@ function simulateScenario(c: Case, i: number, k: number, slope: number): number 
     const uAfter = u0 + ((j + 1) / k) * (u1 - u0);
     const uRefresh = u0 + ((j + 0.5) / k) * (u1 - u0);
     l += slope * (uRefresh - uBefore);
+    // Clock time of this refresh, from its log-time position.
+    const tRefreshMs = RELEASE_MS + (Math.exp(uRefresh) - 1) * 3_600_000;
+    const newPlayers = REFRESH_NEW_PLAYERS_FIRST * Math.pow(REFRESH_NEW_PLAYERS_DECAY, nSeen + j);
+    const mult = (players + newPlayers) / players;
+    players += newPlayers;
+    const rho = ubiquitous ? 1 : rhoAt(tRefreshMs, tFirst);
     const p = invLogitPct(l) / 100;
-    const pDiluted = ubiquitous ? p : dilute(p, playerMult, rho);
+    const pDiluted = ubiquitous ? p : dilute(p, mult, rho);
     l = logit(pDiluted * 100);
     l += slope * (uAfter - uRefresh);
   }
@@ -253,7 +284,7 @@ function simulateScenario(c: Case, i: number, k: number, slope: number): number 
 function growthQuantiles(c: Case, i: number): number[] {
   const horizonHours = c.horizon_minutes / 60;
   const horizonDays = c.horizon_minutes / 1440;
-  const { lambdaPerHour } = refreshParams(c);
+  const lambdaPerHour = refreshRate(c);
   const mean = lambdaPerHour * horizonHours;
   const slope = growthSlope(c, i);
   const lastPct = lastRate(c, i);
